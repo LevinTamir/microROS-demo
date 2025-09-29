@@ -7,7 +7,9 @@
 
 #include <geometry_msgs/msg/twist.h>
 #include <sensor_msgs/msg/joint_state.h>
+// --- changed includes ---
 #include <rosidl_runtime_c/string_functions.h>
+// (you no longer need micro_ros_utilities or primitives_sequence_functions here)
 
 #include <math.h>
 #ifndef M_PI
@@ -15,9 +17,9 @@
 #endif
 
 // =================== Wi-Fi + agent ===================
-char ssid[] = "WIFI";                // your WiFi SSID
-char psk[]  = "100200300";           // your WiFi password
-IPAddress agent_ip(192,168,1,215);   // micro-ROS agent IP
+char ssid[] = "WIFI";                // << your WiFi SSID
+char psk[]  = "100200300";           // << your WiFi password
+IPAddress agent_ip(192,168,1,215);   // << micro-ROS agent IP
 uint16_t agent_port = 8888;
 
 // =================== Motor pins ======================
@@ -28,24 +30,19 @@ uint16_t agent_port = 8888;
 #define IN4 33
 #define ENB 14
 
-// ---------------- Per-wheel direction flip ----------------
-static const bool LEFT_DIR_INVERT  = true;    // flip if left spins wrong way
-static const bool RIGHT_DIR_INVERT = true;   // flip if right spins wrong way
-
-// ---------------- PWM (LEDC) --------------------------
+// PWM (LEDC)
 static const int PWM_CH_A = 0;
 static const int PWM_CH_B = 1;
-static const int PWM_FREQ = 8000;     // 8 kHz – quieter than 3 kHz
-static const int PWM_RES  = 8;        // 0..255 duty
+static const int PWM_FREQ = 3000;      // 3 kHz (quiet on L298N)
+static const int PWM_RES  = 8;         // 0..255 duty
 
-// =================== Kinematics ========================
-static const float WHEEL_RADIUS_M   = 0.033f;
-static const float BASE_WIDTH_M     = 0.135f;
-static const float MAX_RPM          = 150.0f;
-static const float MAX_WHEEL_MS     =
-      (2.0f * M_PI * WHEEL_RADIUS_M) * (MAX_RPM / 60.0f);
+// =================== Kinematics ======================
+static const float WHEEL_RADIUS_M   = 0.033f; // adjust to your wheels
+static const float BASE_WIDTH_M     = 0.135f; // wheel separation (m)
+static const float MAX_RPM          = 150.0f; // adjust to your motors
+static const float MAX_WHEEL_MS     = (2.0f * M_PI * WHEEL_RADIUS_M) * (MAX_RPM / 60.0f);
 
-// Stop if no cmd for this long
+// Safety: how long to keep last command before stopping
 static const uint32_t CMD_TIMEOUT_MS = 500;
 
 // =================== micro-ROS handles ================
@@ -62,17 +59,17 @@ rcl_timer_t joint_timer;
 geometry_msgs__msg__Twist cmd_msg;
 sensor_msgs__msg__JointState joint_msg;
 
-// ---- Static storage for JointState sequences ----
+// ---- Static storage for JointState sequences (fix) ----
 static rosidl_runtime_c__String joint_names_buf[2];
 static double pos_buf[2];
 static double vel_buf[2];
 static double eff_buf[2];
 
 // =================== State ============================
-volatile float v_left_ms  = 0.0f;
+volatile float v_left_ms  = 0.0f;  // commanded wheel linear speed (m/s)
 volatile float v_right_ms = 0.0f;
 
-double pos_left_rad  = 0.0;
+double pos_left_rad  = 0.0;        // integrated wheel angle (rad)
 double pos_right_rad = 0.0;
 uint32_t last_cmd_ms = 0;
 
@@ -102,22 +99,25 @@ static inline uint8_t duty_from_speed(float v_ms) {
 }
 
 static void set_motor_left(float v_ms) {
-  // Apply inversion for this wheel
-  float cmd = LEFT_DIR_INVERT ? -v_ms : v_ms;
-
-  if (cmd >= 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); }
-  else          { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
-
-  ledcWrite(PWM_CH_A, duty_from_speed(cmd));
+  if (v_ms >= 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+  }
+  ledcWrite(PWM_CH_A, duty_from_speed(v_ms));
 }
 
 static void set_motor_right(float v_ms) {
-  float cmd = RIGHT_DIR_INVERT ? -v_ms : v_ms;
-
-  if (cmd >= 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
-  else          { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
-
-  ledcWrite(PWM_CH_B, duty_from_speed(cmd));
+  if (v_ms >= 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+  }
+  ledcWrite(PWM_CH_B, duty_from_speed(v_ms));
 }
 
 static void stop_motors() {
@@ -129,13 +129,14 @@ static void stop_motors() {
 static void cmd_vel_cb(const void * msgin) {
   const geometry_msgs__msg__Twist *m = (const geometry_msgs__msg__Twist *)msgin;
 
-  float v  = (float)m->linear.x;
-  float wz = (float)m->angular.z;
+  float v  = (float)m->linear.x;     // m/s
+  float wz = (float)m->angular.z;    // rad/s
 
-  // differential kinematics
+  // differential kinematics (unicycle → wheels)
   float vL = v - 0.5f * wz * BASE_WIDTH_M;
   float vR = v + 0.5f * wz * BASE_WIDTH_M;
 
+  // clamp to achievable wheel speeds
   if (vL >  MAX_WHEEL_MS) vL =  MAX_WHEEL_MS;
   if (vL < -MAX_WHEEL_MS) vL = -MAX_WHEEL_MS;
   if (vR >  MAX_WHEEL_MS) vR =  MAX_WHEEL_MS;
@@ -150,7 +151,7 @@ static void cmd_vel_cb(const void * msgin) {
   last_cmd_ms = millis();
 }
 
-// Publish JointState at fixed rate
+// Publish JointState at fixed rate, integrate commanded velocity
 static void joint_timer_cb(rcl_timer_t * timer, int64_t /*last_call_time*/) {
   (void) timer;
 
@@ -179,7 +180,8 @@ static void joint_timer_cb(rcl_timer_t * timer, int64_t /*last_call_time*/) {
   joint_msg.velocity.data[0] = wL;
   joint_msg.velocity.data[1] = wR;
 
-  (void)rcl_publish(&joint_pub, &joint_msg, NULL);
+  rcl_ret_t rc = rcl_publish(&joint_pub, &joint_msg, NULL);
+  (void)rc;
 }
 
 // =================== setup ============================
@@ -187,6 +189,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // --- pins
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT);
@@ -199,19 +202,20 @@ void setup() {
 
   stop_motors();
 
-  // Wi-Fi
+  // --- Wi-Fi
   while (!connectWiFi()) {
     Serial.println("[WiFi] retry...");
     delay(1000);
   }
   Serial.print("[WiFi] IP: "); Serial.println(WiFi.localIP());
 
-  // micro-ROS transport
+  // --- micro-ROS transport
   set_microros_wifi_transports(ssid, psk, agent_ip, agent_port);
   Serial.println("[micro-ROS] waiting for agent...");
   waitForAgent();
   Serial.println("[micro-ROS] agent found");
 
+  // --- init RCL
   allocator = rcl_get_default_allocator();
   rclc_support_init(&support, 0, NULL, &allocator);
   rclc_node_init_default(&node, "esp32_diffdrive_node", "", &support);
@@ -228,7 +232,8 @@ void setup() {
       ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
       "/joint_states");
 
-  // prepare JointState message memory
+  // ---- prepare JointState message memory (fixed) ----
+  // names
   joint_msg.name.data     = joint_names_buf;
   joint_msg.name.size     = 2;
   joint_msg.name.capacity = 2;
@@ -237,6 +242,7 @@ void setup() {
   rosidl_runtime_c__String__assign(&joint_msg.name.data[0], "left_wheel_joint");
   rosidl_runtime_c__String__assign(&joint_msg.name.data[1], "right_wheel_joint");
 
+  // numeric arrays
   joint_msg.position.data     = pos_buf;
   joint_msg.position.size     = 2;
   joint_msg.position.capacity = 2;
@@ -251,9 +257,11 @@ void setup() {
   vel_buf[0] = vel_buf[1] = 0.0;
   eff_buf[0] = eff_buf[1] = 0.0;
 
+  // executor: 1 sub + 1 timer
   rclc_executor_init(&executor, &support.context, 2, &allocator);
   rclc_executor_add_subscription(&executor, &cmd_sub, &cmd_msg, &cmd_vel_cb, ON_NEW_DATA);
 
+  // publish joint_states at 50 Hz
   rclc_timer_init_default(
       &joint_timer, &support, RCL_MS_TO_NS(20), joint_timer_cb);
   rclc_executor_add_timer(&executor, &joint_timer);
@@ -267,6 +275,7 @@ void setup() {
 void loop() {
   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(5));
 
+  // simple Wi-Fi watchdog
   if (WiFi.status() != WL_CONNECTED) {
     WiFi.disconnect(true);
     WiFi.begin(ssid, psk);
